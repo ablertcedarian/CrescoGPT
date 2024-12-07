@@ -355,6 +355,7 @@ def runner():
 
     # logging
     if wandb_log:
+        wandb.login(key=WANDB_API_KEY)
         wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
     # training loop
