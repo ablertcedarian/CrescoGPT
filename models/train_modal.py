@@ -12,11 +12,9 @@ base_image = modal.Image.debian_slim(python_version="3.11").pip_install(
     "torch==2.1.2",
     "tensorboard==2.17.1",
     "numpy<2",
-    "tqdm",
-    "tiktoken",
-    "datasets",
     "wandb",
-)
+    "huggingface_hub[hf_transfer]",
+).env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})  # and enable it
 
 
 @app.function(
@@ -24,11 +22,14 @@ base_image = modal.Image.debian_slim(python_version="3.11").pip_install(
     mounts=[
         modal.Mount.from_local_dir(
             "models/",
-            remote_path="/source/data/",
+            remote_path="/source/",
         ),
     ],
     volumes={"/openwebtext/": volume},
-    timeout=60000000,
+    timeout=86400,
+    # gpu="A100",
+    # gpu=modal.gpu.A100(size="80GB"),
+    gpu="H100",
 )
 def runner():
     """
@@ -60,6 +61,7 @@ def runner():
     import torch
     from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.distributed import init_process_group, destroy_process_group
+    from huggingface_hub import HfApi
 
     from .model import GPTConfig, GPT
 
@@ -67,7 +69,8 @@ def runner():
     # default config values designed to train a gpt2 (124M) on OpenWebText
     # I/O
     out_dir = 'out'
-    eval_interval = 2000
+    # eval_interval = 2000
+    eval_interval = 250
     log_interval = 1
     eval_iters = 200
     eval_only = False # if True, script exits right after the first eval
@@ -109,42 +112,42 @@ def runner():
     # -----------------------------------------------------------------------------
 
     out_dir = 'out-shakespeare-char'
-    eval_interval = 250 # keep frequent because we'll overfit
-    eval_iters = 200
-    log_interval = 10 # don't print too too often
+    # eval_interval = 250 # keep frequent because we'll overfit
+    # eval_iters = 200
+    # log_interval = 10 # don't print too too often
 
     # we expect to overfit on this small dataset, so only save when val improves
-    always_save_checkpoint = False
+    # always_save_checkpoint = False
 
     # wandb_log = False # override via command line if you like
     # wandb_project = 'cgpt-test'
     # wandb_run_name = 'mini-schar'
 
     # dataset = 'shakespeare_char'
-    gradient_accumulation_steps = 1
-    batch_size = 64
-    block_size = 256 # context of up to 256 previous characters
+    # gradient_accumulation_steps = 1
+    # batch_size = 64
+    # block_size = 256 # context of up to 256 previous characters
 
-    # baby GPT model :)
-    n_layer = 6
-    n_head = 6
-    n_embd = 384
-    dropout = 0.2
+    # # baby GPT model :)
+    # n_layer = 6
+    # n_head = 6
+    # n_embd = 384
+    # dropout = 0.2
 
-    learning_rate = 1e-3 # with baby networks can afford to go a bit higher
-    max_iters = 5000
-    lr_decay_iters = 5000 # make equal to max_iters usually
-    min_lr = 1e-4 # learning_rate / 10 usually
-    beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
+    # learning_rate = 1e-3 # with baby networks can afford to go a bit higher
+    # max_iters = 600000
+    # lr_decay_iters = 600000 # make equal to max_iters usually
+    # min_lr = 1e-4 # learning_rate / 10 usually
+    # beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 
-    warmup_iters = 100 # not super necessary potentially
+    # warmup_iters = 100 # not super necessary potentially
 
     #####
     config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
     # exec(open('configurator.py').read()) # overrides from command line or config file
     config = {k: globals()[k] for k in config_keys} # will be useful for logging
     # -----------------------------------------------------------------------------
-    arch_name = "tiny"
+    arch_name = "large"
 
     if arch_name == "tiny":
         n_layer = 3
@@ -170,23 +173,76 @@ def runner():
         n_embd = 1024
         block_size = 1024
         batch_size = 8
+        eval_interval = 25
     elif arch_name == "large":
         n_layer = 36
         n_head = 20
         n_embd = 1280
         block_size = 1024
         batch_size = 8
+        eval_interval = 25
     elif arch_name == "xl":
         n_layer = 48
         n_head = 25
         n_embd = 1600
         block_size = 1024
         batch_size = 8
+        eval_interval = 25
+
+    d1 = 0
+    d2 = 0
+    if d1 == 1:
+        n_layer = 6
+    elif d1 == 2:
+        n_layer = 12
+    elif d1 == 3:
+        n_layer = 24
+
+    if d2 == 1:
+        n_embd = 608
+    elif d2 == 2:
+        n_embd = 768
+    elif d2 == 3:
+        n_embd = 1024
+
+    arch_name = arch_name + f'-{d1}-{d2}'
 
     wandb_log = True
     wandb_project = 'cresco'
-    wandb_run_name = f'baseline-{arch_name}-{n_layer}-{n_embd}'
+    wandb_run_name = f'star-{arch_name}-{n_layer}-{n_embd}'
+    # wandb_run_name= f'baseline-{arch_name}-{n_layer}-{n_embd}'
     WANDB_API_KEY = '16f6c877029e38df96355a125195daf0152a3942'
+
+    out_dir = '/openwebtext'
+
+    # init_from = 'resume'
+    init_from = 'scratch'
+    init_file_name = f'baseline-{arch_name}'
+    # init_file_name = 'ckpt-9900.pt'
+    ckpt_path = f'/openwebtext/{init_file_name}'
+
+    run_id_mapper = {
+        "tiny":"5rzutfzr", # baseline-tiny-3-192
+        "mini":"b8i59ank", # baseline-mini-6-384
+        "small":"i65xmv6e", # baseline-small-12-76
+        "med":"c43zi3go", # baseline-med-24-1024
+        "large":"k5ky18rf", # baseline-large-36-12
+        "xl":"ttyi4ny5", # baseline-xl-48-1600
+    }
+    resume_run_id = run_id_mapper[arch_name]
+
+    # huggingface_model_resume = True
+    huggingface_model_resume = False
+
+    if huggingface_model_resume:
+        from huggingface_hub import hf_hub_download
+
+        hf_hub_download(
+            repo_id="abecedarianc/downloader",
+            filename=f"{init_file_name}.pt",
+            local_dir="/openwebtext",
+            token="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",
+        )
 
     # -----------------------------------------------------------------------
 
@@ -224,7 +280,8 @@ def runner():
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    data_dir = os.path.join('data', dataset)
+    # data_dir = os.path.join('data', dataset)
+    data_dir = '/openwebtext'
     def get_batch(split):
         # We recreate np.memmap every batch to avoid a memory leak, as per
         # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -270,7 +327,7 @@ def runner():
     elif init_from == 'resume':
         print(f"Resuming training from {out_dir}")
         # resume training from a checkpoint.
-        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+        # ckpt_path = os.path.join(out_dir, 'ckpt.pt')
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
         # force these config attributes to be equal otherwise we can't even resume training
@@ -356,7 +413,13 @@ def runner():
     # logging
     if wandb_log:
         wandb.login(key=WANDB_API_KEY)
-        wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+        if init_from == 'resume':
+            wandb.init(project=wandb_project, id=resume_run_id, resume="must")
+        else:
+            wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+
+    hf_token = "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"
+    api = HfApi(token=hf_token)
 
     # training loop
     X, Y = get_batch('train') # fetch the very first batch
@@ -385,7 +448,7 @@ def runner():
                     "mfu": running_mfu*100, # convert to percentage
                     "time": (time.time() - t1) / eval_interval if t1 else (time.time() - t0) / eval_interval,
                 })
-            if losses['val'] < best_val_loss or always_save_checkpoint:
+            if (losses['val'] < best_val_loss or always_save_checkpoint):
                 best_val_loss = losses['val']
                 if iter_num > 0:
                     checkpoint = {
@@ -397,7 +460,23 @@ def runner():
                         'config': config,
                     }
                     print(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt-{iter_num}.pt'))
+
+                    model_name = f"{arch_name}"
+                    file_path_saved = os.path.join(out_dir, f'ckpt-{iter_num}.pt')
+                    repo_id = "abecedarianc/downloader"
+                    api.upload_file(
+                        path_or_fileobj=file_path_saved,
+                        path_in_repo=f"{model_name}.pt",
+                        repo_id=repo_id,
+                        repo_type="model",
+                        token=hf_token,
+                        # commit_message=f"Uploading {file_name}"
+                    )
+
+                    if (iter_num % (eval_interval * 4)) != 0:
+                        os.remove(os.path.join(out_dir, f'ckpt-{iter_num}.pt'))
+
         if iter_num == 0 and eval_only:
             break
 
